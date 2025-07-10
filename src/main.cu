@@ -3,6 +3,7 @@
 #include "glm/matrix.hpp"
 #include "happly.h"
 #include "render.cuh"
+#include "octree/octree_builder.cuh"
 
 #include <cstdint>
 #include <filesystem>
@@ -15,6 +16,33 @@
 #include <sstream>
 #include <string>
 #include <sys/types.h>
+
+void PrepareOctreeData(glm::dvec3& bmin, glm::dvec3& bmax, glm::dvec3* vertices, size_t vertexAmt) {
+    for (size_t i = 0; i < vertexAmt; i++) {
+        auto vertex = vertices[i];
+        bmin.x = glm::min(vertex.x, bmin.x);
+        bmin.y = glm::min(vertex.y, bmin.y);
+        bmin.z = glm::min(vertex.z, bmin.z);
+        bmax.x = glm::max(vertex.x, bmax.x);
+        bmax.y = glm::max(vertex.y, bmax.y);
+        bmax.z = glm::max(vertex.z, bmax.z);
+    }
+}
+
+void BuildOctree(TreeConfig& treeConfig, glm::dvec3* host_vertices, glm::dvec3* device_vertices, size_t vertexAmt) {
+    auto bmin = glm::dvec3(std::numeric_limits<double>::max());
+    auto bmax = glm::dvec3(std::numeric_limits<double>::lowest());
+    PrepareOctreeData(bmin, bmax, host_vertices, vertexAmt);
+
+    treeConfig.origin = bmin;
+    treeConfig.size = bmax - bmin;
+
+    OctreeBuilderCuda treeBuilder(treeConfig);
+    treeBuilder.Initialize(vertexAmt);
+    treeBuilder.Build(device_vertices, vertexAmt);
+
+    auto tree = treeBuilder.GetTree();
+}
 
 struct Camera {
   glm::mat3 intrinsic = glm::mat3(1.0f);
@@ -257,11 +285,20 @@ int main(int argc, char *argv[]) {
   double *d_depth_buffer;
   glm::mat4 *d_cam_proj;
   CUDA_ERROR(cudaMalloc(&d_output_image, cam.width * cam.height * 3));
-  CUDA_ERROR(
-      cudaMalloc(&d_depth_buffer, cam.width * cam.height * sizeof(double)))
+  CUDA_ERROR(cudaMalloc(&d_depth_buffer, cam.width * cam.height * sizeof(double)));
   CUDA_ERROR(cudaMalloc(&d_cam_proj, sizeof(glm::mat4)));
-  unsigned char *h_output_image =
-      (unsigned char *)malloc(cam.height * cam.width * 3);
+  unsigned char *h_output_image = (unsigned char *)malloc(cam.height * cam.width * 3);
+
+
+  {
+    auto timer = ScopedTimer("Building octree");
+    auto conf = TreeConfig();
+    conf.maxDepth = 5;
+    conf.threadsPerBlock = 512;
+    conf.minPointsToDivide = 1000;
+    BuildOctree(conf, vertices.data(), d_vertices_data, data_size);
+  }
+
 
   int min_grid_size;
   int block_size;
