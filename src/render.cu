@@ -71,6 +71,15 @@ __device__ unsigned char atomicExch(unsigned char *address, unsigned char val) {
   return old_char_value;
 }
 
+// Kernel to fill a double array with a specific value
+__global__ void fillDoubleArrayKernel(double *devArray, double value,
+                                      int numElements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < numElements) {
+    devArray[idx] = value;
+  }
+}
+
 __global__ void naive(unsigned char *output_data, double *depht_buffer,
                       int width, int height, const glm::mat4 *cam_proj,
                       const glm::dvec3 *points, const glm::ucvec3 *colors,
@@ -95,23 +104,14 @@ __global__ void naive(unsigned char *output_data, double *depht_buffer,
 
   int u = result.x / result.z;
   int v = result.y / result.z;
-  if (u < width && u >= 0 && v < height && v >= 0) {
-    // printf("Pixel coords: (%d, %d, %d)", u, v, (int)result.z);
-    // printf("\tAtomic Min buffer: %.f, val: %.f\n", depht_buffer[v * width +
-    // u],
-    //        result.z);
-    double old = atomicMax(&depht_buffer[v * width + u], result.z);
-    if (result.z > old) {
+  if (u < width && u >= 0 && v < height && v >= 0 && result.z >= 0.0f) {
+
+    double old = atomicMin(&depht_buffer[v * width + u], result.z);
+    if (result.z < old) {
+      // printf("result.z: %.5f", result.z);
       atomicExch(&output_data[(v * width + u) * 3 + 0], color.r);
       atomicExch(&output_data[(v * width + u) * 3 + 1], color.g);
       atomicExch(&output_data[(v * width + u) * 3 + 2], color.b);
-      //   printf("Setting color of (%d, %d) to (%u, %u, %u)\n", v, u, color.r,
-      //          color.g, color.b);
-
-      // printf("ID: %d, Original Point: (%.2f, %.2f, %.2f), Projected
-      // point:(%.2f, "
-      //        "%.2f, %.2f)\n",
-      //        id, point.x, point.y, point.z, result.x, result.y, result.z);
     }
   }
 }

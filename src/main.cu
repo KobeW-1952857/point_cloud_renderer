@@ -9,6 +9,7 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <sys/types.h>
@@ -114,9 +115,9 @@ void savePPMImage(const std::string &filename, const unsigned char *data,
 
   // Write PPM header
   if (binary) {
-    file << "P3\n";
-  } else {
     file << "P6\n";
+  } else {
+    file << "P3\n";
   }
 
   file << width << " " << height << "\n";
@@ -212,22 +213,26 @@ int main(int argc, char *argv[]) {
   unsigned char *h_output_image =
       (unsigned char *)malloc(cam.height * cam.width * 3);
 
+  glm::mat4 *d_cam_proj;
+  cudaMalloc(&d_cam_proj, sizeof(glm::mat4));
+  int min_grid_size;
+  int block_size;
+  cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &block_size, naive);
+  int num_blocks = (data_size + block_size - 1) / block_size;
+
   int i = 0;
   for (auto &extrinsic : extrinsics) {
-    cudaMemset(&d_depth_buffer, 100000,
-               cam.width * cam.height * sizeof(double));
+    fillDoubleArrayKernel<<<num_blocks, block_size>>>(
+        d_depth_buffer, std::numeric_limits<double>::max(),
+        cam.width * cam.height);
 
     glm::mat4 camProj = glm::mat4(glm::transpose(cam.intrinsic)) * extrinsic;
 
-    glm::mat4 *d_cam_proj;
-    cudaMalloc(&d_cam_proj, sizeof(glm::mat4));
     cudaMemcpy(d_cam_proj, glm::value_ptr(camProj), sizeof(glm::mat4),
                cudaMemcpyHostToDevice);
 
-    int min_grid_size;
-    int block_size;
-    cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &block_size, naive);
-    int num_blocks = (data_size + block_size - 1) / block_size;
+    memset(h_output_image, 0, cam.width * cam.height * 3);
+    cudaMemset(d_output_image, 0, cam.width * cam.height * 3);
 
     naive<<<num_blocks, block_size>>>(d_output_image, d_depth_buffer, cam.width,
                                       cam.height, d_cam_proj, d_vertices_data,
