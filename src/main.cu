@@ -146,7 +146,8 @@ void savePPMImage(const std::string &filename, const unsigned char *data,
 
 #define CUDA_ERROR(x)                                                          \
   if (x != cudaSuccess) {                                                      \
-    std::cerr << "CUDA ERROR:" << cudaGetErrorString(x) << std::endl;          \
+    std::cerr << "CUDA ERROR (" << __LINE__ << "):" << cudaGetErrorString(x)   \
+              << std::endl;                                                    \
     return 1;                                                                  \
   }
 
@@ -281,17 +282,19 @@ int main(int argc, char *argv[]) {
     CUDA_ERROR(cudaMemset(d_output_image, 0, cam.width * cam.height * 3));
     memset(h_output_image, 0, cam.width * cam.height * 3);
 
-    naive<<<num_blocks, block_size>>>(d_output_image, d_depth_buffer, cam.width,
-                                      cam.height, d_cam_proj, d_vertices_data,
-                                      d_color_data, data_size);
-
-    cudaDeviceSynchronize();
+    {
+      auto timer = ScopedTimer("Naïve " + std::to_string(i));
+      naive<<<num_blocks, block_size>>>(
+          d_output_image, d_depth_buffer, cam.width, cam.height, d_cam_proj,
+          d_vertices_data, d_color_data, data_size);
+      cudaDeviceSynchronize();
+    }
 
     CUDA_ERROR(cudaMemcpy(h_output_image, d_output_image,
                           cam.height * cam.width * 3, cudaMemcpyDeviceToHost));
 
     savePPMImage(paths.output + "/" + std::to_string(i++) + ".ppm",
-                 h_output_image, cam.width, cam.height, true, true);
+                 h_output_image, cam.width, cam.height, true, false);
   }
 
   cudaFree(&d_vertices_data);

@@ -19,6 +19,7 @@ __device__ double atomicMin(double *address, double val) {
 
   return __longlong_as_double(old);
 }
+
 __device__ double atomicMax(double *address, double val) {
   unsigned long long int *address_as_ull = (unsigned long long int *)address;
   unsigned long long int old = *address_as_ull, assumed;
