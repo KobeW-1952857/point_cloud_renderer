@@ -1,9 +1,11 @@
+#include "Timer.h"
 #include "glm/fwd.hpp"
 #include "glm/matrix.hpp"
 #include "happly.h"
 #include "render.cuh"
 
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -105,7 +107,8 @@ bool readExtrinsics(const std::string &file_path,
 }
 // Function to save raw RGBA pixel data to a PPM image file
 void savePPMImage(const std::string &filename, const unsigned char *data,
-                  int width, int height, bool binary = true) {
+                  int width, int height, bool binary = true,
+                  bool verbose = false) {
   std::ofstream file(filename, binary ? std::ios::binary : std::ios::out);
   if (!file.is_open()) {
     std::cerr << "Error: Could not open file " << filename << " for writing."
@@ -137,84 +140,129 @@ void savePPMImage(const std::string &filename, const unsigned char *data,
   }
 
   file.close();
-  std::cout << "Image saved to " << filename << std::endl;
+  if (verbose)
+    std::cout << "Image saved to " << filename << "\r" << std::flush;
 }
 
+#define CUDA_ERROR(x)                                                          \
+  if (x != cudaSuccess) {                                                      \
+    std::cerr << "CUDA ERROR:" << cudaGetErrorString(x) << std::endl;          \
+    return 1;                                                                  \
+  }
+
+struct Paths {
+  std::string base;
+  std::string data;
+  std::string camera;
+  std::string extrinsics;
+  std::string output;
+  bool succes = true;
+
+  Paths(const std::string base_path, bool verbose = false) : base(base_path) {
+    const std::filesystem::path base = base_path;
+    const std::filesystem::path pc_aligned_rel = "scans/pc_aligned.ply";
+    const std::filesystem::path cameras_rel = "iphone/colmap/cameras.txt";
+    const std::filesystem::path images_rel = "iphone/colmap/images.txt";
+    const std::filesystem::path renders_rel = "renders";
+
+    data = base / pc_aligned_rel;
+    camera = base / cameras_rel;
+    extrinsics = base / images_rel;
+    output = base / renders_rel;
+
+    if (!std::filesystem::exists(data) ||
+        !std::filesystem::is_regular_file(data)) {
+      std::cerr << "Error: Required file not found or is not a regular file: "
+                << data << std::endl;
+      succes = false;
+      return;
+    }
+    if (!std::filesystem::exists(camera) ||
+        !std::filesystem::is_regular_file(camera)) {
+      std::cerr << "Error: Required file not found or is not a regular file: "
+                << camera << std::endl;
+      succes = false;
+      return;
+    }
+    if (!std::filesystem::exists(extrinsics) ||
+        !std::filesystem::is_regular_file(extrinsics)) {
+      std::cerr << "Error: Required file not found or is not a regular file: "
+                << extrinsics << std::endl;
+      succes = false;
+      return;
+    }
+    if (!std::filesystem::exists(output) ||
+        !std::filesystem::is_directory(output)) {
+      std::cerr << "Error: Required directory not found or is not a directory, "
+                   "creating directory: "
+                << output << std::endl;
+      std::filesystem::create_directory(output);
+    }
+    if (verbose)
+      std::cout << "All required paths exist and are valid." << std::endl;
+  }
+};
+
 int main(int argc, char *argv[]) {
-  if (argc < 5) {
+  if (argc < 2) {
     std::cerr << "Wrong arguments suplied\nUsage: " << argv[0]
-              << " <data_path> <camera_path> <extrinsics_path> <output_folder>"
-              << std::endl;
+              << " <model_path>" << std::endl;
     return 1;
   }
 
-  happly::PLYData point_cloud(argv[1]);
-  auto vertices = point_cloud.getVertexPositions();
-  auto colors = point_cloud.getVertexColors();
+  Paths paths(argv[1]);
+  if (!paths.succes)
+    return 1;
+
+  std::vector<glm::dvec3> vertices;
+  std::vector<glm::ucvec3> colors;
+
+  {
+    auto timer = ScopedTimer("Load PLY file");
+    happly::PLYData point_cloud(paths.data);
+    vertices = point_cloud.getVertexPositions();
+    colors = point_cloud.getVertexColors();
+  }
 
   const size_t data_size = vertices.size();
   glm::dvec3 *d_vertices_data;
   glm::ucvec3 *d_color_data;
 
-  std::cout << "Points to render:" << data_size << std::endl;
+  std::cout << "Points to in point cloud:" << data_size << std::endl;
 
-  cudaError_t cudaStatus =
-      cudaMalloc(&d_vertices_data, data_size * sizeof(glm::dvec3));
-  if (cudaStatus != cudaSuccess) {
-    std::cerr << "cudaMalloc failed!" << cudaGetErrorString(cudaStatus)
-              << std::endl;
-    return 1;
-  }
+  CUDA_ERROR(cudaMalloc(&d_vertices_data, data_size * sizeof(glm::dvec3)))
+  CUDA_ERROR(cudaMalloc(&d_color_data, data_size * sizeof(glm::ucvec3)))
 
-  cudaStatus = cudaMalloc(&d_color_data, data_size * sizeof(glm::ucvec3));
-  if (cudaStatus != cudaSuccess) {
-    std::cerr << "cudaMalloc failed!" << cudaGetErrorString(cudaStatus)
-              << std::endl;
-    return 1;
-  }
-
-  std::cout << "Successful in allocating memory on the gpu" << std::endl;
-  cudaMemcpy(d_vertices_data, vertices.data(), data_size * sizeof(glm::dvec3),
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(d_color_data, colors.data(), data_size * sizeof(glm::ucvec3),
-             cudaMemcpyHostToDevice);
-
-  std::cout << "Reading camera data" << std::endl;
+  CUDA_ERROR(cudaMemcpy(d_vertices_data, vertices.data(),
+                        data_size * sizeof(glm::dvec3),
+                        cudaMemcpyHostToDevice));
+  CUDA_ERROR(cudaMemcpy(d_color_data, colors.data(),
+                        data_size * sizeof(glm::ucvec3),
+                        cudaMemcpyHostToDevice));
 
   Camera cam;
-  if (!readCameraFile(argv[2], cam)) {
-    std::cerr << "Problem reading camera file: " << argv[2] << std::endl;
+  if (!readCameraFile(paths.camera, cam)) {
+    std::cerr << "Problem reading camera file: " << paths.camera << std::endl;
     return 1;
   }
   std::vector<glm::mat4> extrinsics;
-  if (!readExtrinsics(argv[3], extrinsics)) {
-    std::cerr << "Problem reading extrinsics file: " << argv[3] << std::endl;
+  if (!readExtrinsics(paths.extrinsics, extrinsics)) {
+    std::cerr << "Problem reading extrinsics file: " << paths.extrinsics
+              << std::endl;
     return 1;
   }
+  std::cout << "Rendering " << extrinsics.size() << " images" << std::endl;
 
   uint8_t *d_output_image;
-
-  cudaStatus = cudaMalloc(&d_output_image, cam.width * cam.height * 3);
-
-  if (cudaStatus != cudaSuccess) {
-    std::cerr << "cudaMalloc failed!" << cudaGetErrorString(cudaStatus)
-              << std::endl;
-    return 1;
-  }
-
   double *d_depth_buffer;
-  cudaStatus =
-      cudaMalloc(&d_depth_buffer, cam.width * cam.height * sizeof(double));
-  if (cudaStatus != cudaSuccess) {
-    std::cerr << "cudaMalloc failed!" << cudaGetErrorString(cudaStatus)
-              << std::endl;
-    return 1;
-  }
+  glm::mat4 *d_cam_proj;
+  CUDA_ERROR(cudaMalloc(&d_output_image, cam.width * cam.height * 3));
+  CUDA_ERROR(
+      cudaMalloc(&d_depth_buffer, cam.width * cam.height * sizeof(double)))
+  CUDA_ERROR(cudaMalloc(&d_cam_proj, sizeof(glm::mat4)));
   unsigned char *h_output_image =
       (unsigned char *)malloc(cam.height * cam.width * 3);
 
-  glm::mat4 *d_cam_proj;
-  cudaMalloc(&d_cam_proj, sizeof(glm::mat4));
   int min_grid_size;
   int block_size;
   cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &block_size, naive);
@@ -228,22 +276,22 @@ int main(int argc, char *argv[]) {
 
     glm::mat4 camProj = glm::mat4(glm::transpose(cam.intrinsic)) * extrinsic;
 
-    cudaMemcpy(d_cam_proj, glm::value_ptr(camProj), sizeof(glm::mat4),
-               cudaMemcpyHostToDevice);
-
+    CUDA_ERROR(cudaMemcpy(d_cam_proj, glm::value_ptr(camProj),
+                          sizeof(glm::mat4), cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemset(d_output_image, 0, cam.width * cam.height * 3));
     memset(h_output_image, 0, cam.width * cam.height * 3);
-    cudaMemset(d_output_image, 0, cam.width * cam.height * 3);
 
     naive<<<num_blocks, block_size>>>(d_output_image, d_depth_buffer, cam.width,
                                       cam.height, d_cam_proj, d_vertices_data,
                                       d_color_data, data_size);
+
     cudaDeviceSynchronize();
 
-    cudaMemcpy(h_output_image, d_output_image, cam.height * cam.width * 3,
-               cudaMemcpyDeviceToHost);
+    CUDA_ERROR(cudaMemcpy(h_output_image, d_output_image,
+                          cam.height * cam.width * 3, cudaMemcpyDeviceToHost));
 
-    savePPMImage(std::string(argv[4]) + "/" + std::to_string(i++) + ".ppm",
-                 h_output_image, cam.width, cam.height);
+    savePPMImage(paths.output + "/" + std::to_string(i++) + ".ppm",
+                 h_output_image, cam.width, cam.height, true, true);
   }
 
   cudaFree(&d_vertices_data);

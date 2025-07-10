@@ -1,10 +1,11 @@
 {
 	"cmake.debugConfig": {
 		"args": [
-			"../data/47eb87b5bb/scans/pc_aligned.ply",
-			"../data/47eb87b5bb/iphone/colmap/cameras.txt",
-			"../data/47eb87b5bb/iphone/colmap/images.txt",
-			"../data/47eb87b5bb/renders"
+			"../data/47eb87b5bb"
+			// "../data/47eb87b5bb/scans/pc_aligned.ply",
+			// "../data/47eb87b5bb/iphone/colmap/cameras.txt",
+			// "../data/47eb87b5bb/iphone/colmap/images.txt",
+			// "../data/47eb87b5bb/renders"
 		]
 	}
 }

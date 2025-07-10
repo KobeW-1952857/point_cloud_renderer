@@ -108,7 +108,6 @@ __global__ void naive(unsigned char *output_data, double *depht_buffer,
 
     double old = atomicMin(&depht_buffer[v * width + u], result.z);
     if (result.z < old) {
-      // printf("result.z: %.5f", result.z);
       atomicExch(&output_data[(v * width + u) * 3 + 0], color.r);
       atomicExch(&output_data[(v * width + u) * 3 + 1], color.g);
       atomicExch(&output_data[(v * width + u) * 3 + 2], color.b);
