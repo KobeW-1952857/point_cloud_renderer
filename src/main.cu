@@ -3,7 +3,8 @@
 #include "glm/matrix.hpp"
 #include "happly.h"
 #include "render.cuh"
-#include "octree/octree_builder.cuh"
+#include "lod/lod.cuh"
+#include "lod/lod_util.cuh"
 
 #include <cstdint>
 #include <filesystem>
@@ -16,33 +17,48 @@
 #include <sstream>
 #include <string>
 #include <sys/types.h>
+#include <utility>
+#include <unordered_map>
 
-void PrepareOctreeData(glm::dvec3& bmin, glm::dvec3& bmax, glm::dvec3* vertices, size_t vertexAmt) {
-    for (size_t i = 0; i < vertexAmt; i++) {
-        auto vertex = vertices[i];
-        bmin.x = glm::min(vertex.x, bmin.x);
-        bmin.y = glm::min(vertex.y, bmin.y);
-        bmin.z = glm::min(vertex.z, bmin.z);
-        bmax.x = glm::max(vertex.x, bmax.x);
-        bmax.y = glm::max(vertex.y, bmax.y);
-        bmax.z = glm::max(vertex.z, bmax.z);
-    }
+DVecPair findAABB(glm::dvec3* vertices, size_t vertexAmt) {
+  glm::dvec3 bmin(std::numeric_limits<double>::max());
+  glm::dvec3 bmax(std::numeric_limits<double>::lowest());
+
+  for (size_t i = 0; i < vertexAmt; ++i) {
+    const auto& v = vertices[i];
+    bmin = glm::min(bmin, v);
+    bmax = glm::max(bmax, v);
+  }
+
+  return { bmin, bmax };
 }
 
-void BuildOctree(TreeConfig& treeConfig, glm::dvec3* host_vertices, glm::dvec3* device_vertices, size_t vertexAmt) {
-    auto bmin = glm::dvec3(std::numeric_limits<double>::max());
-    auto bmax = glm::dvec3(std::numeric_limits<double>::lowest());
-    PrepareOctreeData(bmin, bmax, host_vertices, vertexAmt);
+void buildLODStructure(glm::dvec3* pos_host, glm::dvec3* pos_device, glm::ucvec3* col, size_t vertexAmt,
+                       unsigned int* outputCounter, CLODPoints output) {
+  auto aabb = findAABB(pos_host, vertexAmt);
 
-    treeConfig.origin = bmin;
-    treeConfig.size = bmax - bmin;
-
-    OctreeBuilderCuda treeBuilder(treeConfig);
-    treeBuilder.Initialize(vertexAmt);
-    treeBuilder.Build(device_vertices, vertexAmt);
-
-    auto tree = treeBuilder.GetTree();
+  buildCLODLevels_denseGrid(pos_device, col, vertexAmt, aabb.first, aabb.second,
+                             ROOT_SPACING, LEVELS_AMT, output, outputCounter);
 }
+
+void printLevelHistogram(size_t vertexAmt, const CLODPoints* d_output) {
+  std::vector<glm::ucvec4> host_cols(vertexAmt);
+  if (cudaMemcpy(host_cols.data(), d_output->cols, vertexAmt * sizeof(glm::ucvec4), cudaMemcpyDeviceToHost) != cudaSuccess) {
+    std::cerr << "CUDA memcpy failed" << std::endl;
+    return;
+  }
+
+  std::unordered_map<int, size_t> level_counts;
+  for (const auto& col : host_cols) {
+    level_counts[col.w]++;
+  }
+
+  std::cout << "Points per level:\n";
+  for (const auto& [level, count] : level_counts) {
+    std::cout << "  Level " << level << ": " << count << " points\n";
+  }
+}
+
 
 struct Camera {
   glm::mat3 intrinsic = glm::mat3(1.0f);
@@ -231,110 +247,227 @@ struct Paths {
   }
 };
 
-int main(int argc, char *argv[]) {
+void render(const std::vector<glm::mat4>& extrinsics,
+            const Camera& cam,
+            const std::string& output_path,
+            glm::dvec3* d_vertices_data,
+            glm::ucvec3* d_color_data,
+            size_t data_size,
+            uint8_t* d_output_image,
+            double* d_depth_buffer,
+            glm::mat4* d_cam_proj,
+            unsigned char* h_output_image,
+            bool enable_timing) {
+  
+  int min_grid_size, block_size;
+  cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &block_size, naive);
+  int num_blocks = (data_size + block_size - 1) / block_size;
+
+  OptionalTimerWriter timer_writer(enable_timing, "../timings_naive.txt");
+
+  for (size_t i = 0; i < extrinsics.size(); ++i) {
+    const auto& extrinsic = extrinsics[i];
+    SteadyTimer timer;
+
+    fillDoubleArrayKernel<<<num_blocks, block_size>>>(
+        d_depth_buffer,
+        std::numeric_limits<double>::max(),
+        cam.width * cam.height
+    );
+
+    glm::mat4 cam_proj = glm::mat4(glm::transpose(cam.intrinsic)) * extrinsic;
+    cudaMemcpy(d_cam_proj, glm::value_ptr(cam_proj),
+               sizeof(glm::mat4), cudaMemcpyHostToDevice);
+
+    cudaMemset(d_output_image, 0, cam.width * cam.height * 3);
+    memset(h_output_image, 0, cam.width * cam.height * 3);
+
+    // naive<<<num_blocks, block_size>>>(
+    //     d_output_image, d_depth_buffer,
+    //     cam.width, cam.height,
+    //     d_cam_proj,
+    //     d_vertices_data, d_color_data, data_size
+    // );
+
+    cudaDeviceSynchronize();
+    timer_writer.write(timer.ElapsedMillis());
+
+    cudaMemcpy(h_output_image, d_output_image,
+               cam.width * cam.height * 3, cudaMemcpyDeviceToHost);
+    savePPMImage(output_path + "/" + std::to_string(i) + ".ppm",
+                 h_output_image, cam.width, cam.height, true, true);
+  }
+}
+
+
+void renderLODs(const std::vector<glm::mat4>& extrinsics,
+                const Camera& cam,
+                const std::string& output_path,
+                CLODPoints clod_points,
+                size_t data_size,
+                uint8_t* d_output_image,
+                double* d_depth_buffer,
+                glm::mat4* d_cam_proj,
+                unsigned char* h_output_image,
+                glm::dvec3* pos_render_buf,
+                glm::ucvec3* col_render_buf,
+                bool enable_timing) {
+  
+  unsigned int* d_filtered_points_amt = nullptr;
+  cudaMalloc(&d_filtered_points_amt, sizeof(unsigned int));
+
+  int min_grid_size, block_size;
+  cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &block_size, naive);
+  int num_blocks = (data_size + block_size - 1) / block_size;
+  
+  OptionalTimerWriter timer_writer(enable_timing, "../timings_lod.txt");
+
+  for (size_t i = 0; i < extrinsics.size(); ++i) {
+    const auto& extrinsic = extrinsics[i];
+    SteadyTimer timer;
+
+    cudaMemset(d_filtered_points_amt, 0, sizeof(unsigned int));
+
+    fillDoubleArrayKernel<<<num_blocks, block_size>>>(
+        d_depth_buffer,
+        std::numeric_limits<double>::max(),
+        cam.width * cam.height
+    );
+
+    glm::vec3 cam_pos = glm::vec3(glm::inverse(extrinsic)[3]);
+    glm::mat4 cam_proj = glm::mat4(glm::transpose(cam.intrinsic)) * extrinsic;
+    cudaMemcpy(d_cam_proj, glm::value_ptr(cam_proj),
+               sizeof(glm::mat4), cudaMemcpyHostToDevice);
+
+    cudaMemset(d_output_image, 0, cam.width * cam.height * 3);
+    memset(h_output_image, 0, cam.width * cam.height * 3);
+
+    filterPointsKernel<<<num_blocks, block_size>>>(
+        clod_points, cam_pos,
+        ROOT_SPACING, CLOD_FACTOR,
+        data_size,
+        pos_render_buf, col_render_buf,
+        d_filtered_points_amt
+    );
+    cudaDeviceSynchronize();
+
+    naive<<<num_blocks, block_size>>>(
+        d_output_image, d_depth_buffer,
+        cam.width, cam.height,
+        d_cam_proj,
+        pos_render_buf, col_render_buf, d_filtered_points_amt
+    );
+    cudaDeviceSynchronize();
+
+    timer_writer.write(timer.ElapsedMillis());
+
+    cudaMemcpy(h_output_image, d_output_image,
+               cam.width * cam.height * 3, cudaMemcpyDeviceToHost);
+    savePPMImage(output_path + "/" + std::to_string(i) + ".ppm",
+                 h_output_image, cam.width, cam.height, true, true);
+  }
+
+  cudaFree(d_filtered_points_amt);
+}
+
+
+
+int main(int argc, char* argv[]) {
   if (argc < 2) {
-    std::cerr << "Wrong arguments suplied\nUsage: " << argv[0]
-              << " <model_path>" << std::endl;
+    std::cerr << "Usage: " << argv[0] << " <model_path>\n";
     return 1;
   }
 
   Paths paths(argv[1]);
-  if (!paths.succes)
-    return 1;
+  if (!paths.succes) return 1;
+
+  bool debug = false;
+  if (argc == 3) {
+    if (std::strcmp(argv[2], "--debug") == 0) {
+      debug = true;
+    } else {
+      std::cerr << "Usage: " << argv[0] << " <model_path> " << "(--debug)\n";
+      return 1;
+    }
+  }
 
   std::vector<glm::dvec3> vertices;
   std::vector<glm::ucvec3> colors;
 
   {
     auto timer = ScopedTimer("Load PLY file");
-    happly::PLYData point_cloud(paths.data);
-    vertices = point_cloud.getVertexPositions();
-    colors = point_cloud.getVertexColors();
+    happly::PLYData ply(paths.data);
+    vertices = ply.getVertexPositions();
+    colors = ply.getVertexColors();
   }
 
-  const size_t data_size = vertices.size();
-  glm::dvec3 *d_vertices_data;
-  glm::ucvec3 *d_color_data;
+  size_t data_size = vertices.size();
+  std::cout << "Loaded " << data_size << " points.\n";
 
-  std::cout << "Points to in point cloud:" << data_size << std::endl;
-
-  CUDA_ERROR(cudaMalloc(&d_vertices_data, data_size * sizeof(glm::dvec3)))
-  CUDA_ERROR(cudaMalloc(&d_color_data, data_size * sizeof(glm::ucvec3)))
-
-  CUDA_ERROR(cudaMemcpy(d_vertices_data, vertices.data(),
-                        data_size * sizeof(glm::dvec3),
-                        cudaMemcpyHostToDevice));
-  CUDA_ERROR(cudaMemcpy(d_color_data, colors.data(),
-                        data_size * sizeof(glm::ucvec3),
-                        cudaMemcpyHostToDevice));
+  glm::dvec3* d_vertices_data;
+  glm::ucvec3* d_color_data;
+  CUDA_ERROR(cudaMalloc(&d_vertices_data, data_size * sizeof(glm::dvec3)));
+  CUDA_ERROR(cudaMalloc(&d_color_data, data_size * sizeof(glm::ucvec3)));
+  CUDA_ERROR(cudaMemcpy(d_vertices_data, vertices.data(), data_size * sizeof(glm::dvec3), cudaMemcpyHostToDevice));
+  CUDA_ERROR(cudaMemcpy(d_color_data, colors.data(), data_size * sizeof(glm::ucvec3), cudaMemcpyHostToDevice));
 
   Camera cam;
   if (!readCameraFile(paths.camera, cam)) {
-    std::cerr << "Problem reading camera file: " << paths.camera << std::endl;
+    std::cerr << "Failed to load camera file.\n";
     return 1;
   }
+
   std::vector<glm::mat4> extrinsics;
   if (!readExtrinsics(paths.extrinsics, extrinsics)) {
-    std::cerr << "Problem reading extrinsics file: " << paths.extrinsics
-              << std::endl;
+    std::cerr << "Failed to load extrinsics file.\n";
     return 1;
   }
-  std::cout << "Rendering " << extrinsics.size() << " images" << std::endl;
 
-  uint8_t *d_output_image;
-  double *d_depth_buffer;
-  glm::mat4 *d_cam_proj;
+  std::cout << "Rendering " << extrinsics.size() << " frames...\n";
+
+  uint8_t* d_output_image;
+  double* d_depth_buffer;
+  glm::mat4* d_cam_proj;
   CUDA_ERROR(cudaMalloc(&d_output_image, cam.width * cam.height * 3));
   CUDA_ERROR(cudaMalloc(&d_depth_buffer, cam.width * cam.height * sizeof(double)));
   CUDA_ERROR(cudaMalloc(&d_cam_proj, sizeof(glm::mat4)));
-  unsigned char *h_output_image = (unsigned char *)malloc(cam.height * cam.width * 3);
 
+  auto* h_output_image = (unsigned char*)malloc(cam.width * cam.height * 3);
 
-  {
-    auto timer = ScopedTimer("Building octree");
-    auto conf = TreeConfig();
-    conf.maxDepth = 5;
-    conf.threadsPerBlock = 512;
-    conf.minPointsToDivide = 1000;
-    BuildOctree(conf, vertices.data(), d_vertices_data, data_size);
-  }
+  // LOD
+  CLODPoints clodPoints;
+  unsigned int* clodCounter;
+  CUDA_ERROR(cudaMalloc(&clodCounter, sizeof(unsigned int)));
+  CUDA_ERROR(cudaMemset(clodCounter, 0, sizeof(unsigned int)));
+  CUDA_ERROR(cudaMalloc(&clodPoints.positions, data_size * sizeof(glm::dvec3)));
+  CUDA_ERROR(cudaMalloc(&clodPoints.cols, data_size * sizeof(glm::ucvec4)));
 
+  // final rendering buffer
+  glm::dvec3* pos_render_buffer;
+  glm::ucvec3* color_render_buffer;
+  CUDA_ERROR(cudaMalloc(&pos_render_buffer, data_size * sizeof(glm::dvec3)));
+  CUDA_ERROR(cudaMalloc(&color_render_buffer, data_size * sizeof(glm::ucvec3)));
 
-  int min_grid_size;
-  int block_size;
-  cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &block_size, naive);
-  int num_blocks = (data_size + block_size - 1) / block_size;
+  buildLODStructure(vertices.data(), d_vertices_data, d_color_data, data_size, clodCounter, clodPoints);
+  printLevelHistogram(data_size, &clodPoints);
 
-  int i = 0;
-  for (auto &extrinsic : extrinsics) {
-    fillDoubleArrayKernel<<<num_blocks, block_size>>>(
-        d_depth_buffer, std::numeric_limits<double>::max(),
-        cam.width * cam.height);
+  renderLODs(extrinsics, cam, paths.output, clodPoints, data_size,
+             d_output_image, d_depth_buffer, d_cam_proj, h_output_image,
+             pos_render_buffer, color_render_buffer, debug);
 
-    glm::mat4 camProj = glm::mat4(glm::transpose(cam.intrinsic)) * extrinsic;
+  // render(extrinsics, cam, paths.output, d_vertices_data, d_color_data, 
+  //   data_size, d_output_image, d_depth_buffer, d_cam_proj, h_output_image, debug);
 
-    CUDA_ERROR(cudaMemcpy(d_cam_proj, glm::value_ptr(camProj),
-                          sizeof(glm::mat4), cudaMemcpyHostToDevice));
-    CUDA_ERROR(cudaMemset(d_output_image, 0, cam.width * cam.height * 3));
-    memset(h_output_image, 0, cam.width * cam.height * 3);
-
-    naive<<<num_blocks, block_size>>>(d_output_image, d_depth_buffer, cam.width,
-                                      cam.height, d_cam_proj, d_vertices_data,
-                                      d_color_data, data_size);
-
-    cudaDeviceSynchronize();
-
-    CUDA_ERROR(cudaMemcpy(h_output_image, d_output_image,
-                          cam.height * cam.width * 3, cudaMemcpyDeviceToHost));
-
-    savePPMImage(paths.output + "/" + std::to_string(i++) + ".ppm",
-                 h_output_image, cam.width, cam.height, true, true);
-  }
-
-  cudaFree(&d_vertices_data);
-  cudaFree(&d_color_data);
-  cudaFree(&d_depth_buffer);
-  cudaFree(&d_output_image);
+  // cleanup
+  cudaFree(d_vertices_data);
+  cudaFree(d_color_data);
+  cudaFree(d_output_image);
+  cudaFree(d_depth_buffer);
+  cudaFree(d_cam_proj);
+  cudaFree(clodPoints.positions);
+  cudaFree(clodPoints.cols);
+  cudaFree(pos_render_buffer);
+  cudaFree(color_render_buffer);
   free(h_output_image);
 
   return 0;

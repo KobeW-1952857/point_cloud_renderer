@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 set(CMAKE_CUDA_ARCHITECTURES 86)
-set(CMAKE_CUDA_COMPILER /usr/local/cuda-11.8/bin/nvcc)
+set(CMAKE_CUDA_COMPILER /usr/local/cuda-12.9/bin/nvcc)
 project(PointCloudRenderer LANGUAGES CXX CUDA)
 add_executable(PointCloudRenderer)
 set(CMAKE_CXX_STANDARD 17)
@@ -10,7 +10,8 @@ file(GLOB headers "${CMAKE_CURRENT_SOURCE_DIR}/include/*")
 file(GLOB sources1 "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c*")
 file(GLOB sources2 "${CMAKE_CURRENT_SOURCE_DIR}/src/octree/*.c*")
 file(GLOB sources3 "${CMAKE_CURRENT_SOURCE_DIR}/src/util/*.c*")
-set(sources ${sources1} ${sources2} ${sources3})
+file(GLOB sources4 "${CMAKE_CURRENT_SOURCE_DIR}/src/lod/*.c*")
+set(sources ${sources1} ${sources2} ${sources3} ${sources4})
 
 
 include(FetchContent)

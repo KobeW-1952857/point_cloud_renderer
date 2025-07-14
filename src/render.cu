@@ -83,21 +83,16 @@ __global__ void fillDoubleArrayKernel(double *devArray, double value,
 __global__ void naive(unsigned char *output_data, double *depht_buffer,
                       int width, int height, const glm::mat4 *cam_proj,
                       const glm::dvec3 *points, const glm::ucvec3 *colors,
-                      size_t n_points) {
+                      const unsigned int* n_points) {
   int id = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (id > n_points)
-    return;
+  if (id >= *n_points) return;
 
   glm::dvec3 point = points[id];
   glm::ucvec3 color = colors[id];
 
   // Convert input double3 to homogeneous double4
-  glm::vec4 pointHomogeneous;
-  pointHomogeneous.x = points[id].x;
-  pointHomogeneous.y = points[id].y;
-  pointHomogeneous.z = points[id].z;
-  pointHomogeneous.w = 1.0; // W component for a point
+  glm::vec4 pointHomogeneous(point, 1.0);
 
   // Perform matrix-vector multiplication
   glm::vec4 result = *cam_proj * pointHomogeneous;

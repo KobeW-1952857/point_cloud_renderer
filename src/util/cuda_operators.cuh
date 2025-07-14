@@ -156,3 +156,8 @@ inline  __host__ __device__ glm::dvec3 operator*(glm::dvec3 a, float b)
 {
     return { a.x * b, a.y * b, a.z * b };
 }
+
+inline  __host__ __device__ glm::dvec3 operator/(glm::dvec3 a, float b)
+{
+    return { a.x / b, a.y / b, a.z / b };
+}

@@ -2,6 +2,8 @@
 # Created by https://www.toptal.com/developers/gitignore/api/visualstudiocode,linux,c++,cmake,cuda
 # Edit at https://www.toptal.com/developers/gitignore?templates=visualstudiocode,linux,c++,cmake,cuda
 
+timings*.txt
+
 ### C++ ###
 # Prerequisites
 *.d
