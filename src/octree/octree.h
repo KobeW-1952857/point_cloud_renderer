@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../util/cuda_operators.cuh"
+#include "../util/cuda_util.cuh"
 #include "aabb.h"
 
 struct Octree

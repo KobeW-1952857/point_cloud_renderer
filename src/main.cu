@@ -282,12 +282,12 @@ void render(const std::vector<glm::mat4>& extrinsics,
     cudaMemset(d_output_image, 0, cam.width * cam.height * 3);
     memset(h_output_image, 0, cam.width * cam.height * 3);
 
-    // naive<<<num_blocks, block_size>>>(
-    //     d_output_image, d_depth_buffer,
-    //     cam.width, cam.height,
-    //     d_cam_proj,
-    //     d_vertices_data, d_color_data, data_size
-    // );
+    naive<<<num_blocks, block_size>>>(
+        d_output_image, d_depth_buffer,
+        cam.width, cam.height,
+        d_cam_proj,
+        d_vertices_data, d_color_data, data_size
+    );
 
     cudaDeviceSynchronize();
     timer_writer.write(timer.ElapsedMillis());
@@ -316,9 +316,12 @@ void renderLODs(const std::vector<glm::mat4>& extrinsics,
   unsigned int* d_filtered_points_amt = nullptr;
   cudaMalloc(&d_filtered_points_amt, sizeof(unsigned int));
 
-  int min_grid_size, block_size;
-  cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &block_size, naive);
-  int num_blocks = (data_size + block_size - 1) / block_size;
+  int blkFilter = optimalBlockSize<filterPointsKernel>();
+  int blkNaive  = optimalBlockSize<naive>();
+  int gridFilter = (data_size + blkFilter - 1) / blkFilter;
+  int gridNaive  = (data_size + blkNaive  - 1) / blkNaive;
+  int gridFillArr = (cam.width * cam.height + 255)/256;
+  int blkFillArr = 256
   
   OptionalTimerWriter timer_writer(enable_timing, "../timings_lod.txt");
 
@@ -328,7 +331,7 @@ void renderLODs(const std::vector<glm::mat4>& extrinsics,
 
     cudaMemset(d_filtered_points_amt, 0, sizeof(unsigned int));
 
-    fillDoubleArrayKernel<<<num_blocks, block_size>>>(
+    fillDoubleArrayKernel<<<gridFillArr, blkFillArr>>>(
         d_depth_buffer,
         std::numeric_limits<double>::max(),
         cam.width * cam.height
@@ -342,7 +345,7 @@ void renderLODs(const std::vector<glm::mat4>& extrinsics,
     cudaMemset(d_output_image, 0, cam.width * cam.height * 3);
     memset(h_output_image, 0, cam.width * cam.height * 3);
 
-    filterPointsKernel<<<num_blocks, block_size>>>(
+    filterPointsKernel<<<gridFilter, blkFilter>>>(
         clod_points, cam_pos,
         ROOT_SPACING, CLOD_FACTOR,
         data_size,
@@ -351,7 +354,7 @@ void renderLODs(const std::vector<glm::mat4>& extrinsics,
     );
     cudaDeviceSynchronize();
 
-    naive<<<num_blocks, block_size>>>(
+    naive<<<gridNaive, blkNaive>>>(
         d_output_image, d_depth_buffer,
         cam.width, cam.height,
         d_cam_proj,

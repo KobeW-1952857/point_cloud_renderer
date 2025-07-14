@@ -1,6 +1,6 @@
 #pragma once
 #include <glm/glm.hpp>
-#include "../util/cuda_operators.cuh"
+#include "../util/cuda_util.cuh"
 #include "../util/types.cuh"
 #include "lod_util.cuh"
 
@@ -18,7 +18,7 @@ __global__ void markVoxelsMinIdx(
     if (idx >= numPoints || writtenFlags[idx]) return;
     
     glm::dvec3 pos = positions[idx];
-    glm::ivec3 voxelCoord = (pos - aabbMin) / spacing;
+    glm::ivec3 voxelCoord = glm::floor((pos - aabbMin) / spacing);
 
     if (voxelCoord.x < 0 || voxelCoord.y < 0 || voxelCoord.z < 0 ||
         voxelCoord.x >= gridRes.x || voxelCoord.y >= gridRes.y || voxelCoord.z >= gridRes.z)
@@ -48,11 +48,12 @@ __global__ void sweepWinners(
     uint32_t winnerIdx = voxelOwners[voxelIdx];
     if (winnerIdx == 0xFFFFFFFF) return;
 
+    // TODO: race condition
     if (!writtenFlags[winnerIdx]) {
+        writtenFlags[winnerIdx] = true;
         int outIdx = atomicAdd(outputCounter, 1);
         output.positions[outIdx] = positions[winnerIdx];
         output.cols[outIdx] = glm::ucvec4(colors[winnerIdx], level);
-        writtenFlags[winnerIdx] = true;
     }
 }
 
@@ -70,10 +71,10 @@ __global__ void emitRemainingPoints(
     if (idx >= numPoints) return;
 
     if (!writtenFlags[idx]) {
+        writtenFlags[idx] = true;
         int outIdx = atomicAdd(outputCounter, 1);
         output.positions[outIdx] = positions[idx];
         output.cols[outIdx] = glm::ucvec4(colors[idx], level);        
-        writtenFlags[idx] = true;
     }
 }
 
@@ -89,8 +90,9 @@ void buildCLODLevels_denseGrid(
     CLODPoints output,
     unsigned int* outputCounter
 ) {
-    const int threads = 256;
-    const dim3 blocksPoints = dim3((numPoints + threads - 1) / threads);
+    const int blkPoints = optimalBlockSize<markVoxelsMinIdx>(); 
+    const int blkVoxels = optimalBlockSize<sweepWinners>();
+    dim3 blocksPoints((numPoints + blkPoints - 1) / blkPoints);
 
     bool* d_writtenFlags;
     cudaMalloc(&d_writtenFlags, sizeof(bool) * numPoints);
@@ -101,7 +103,7 @@ void buildCLODLevels_denseGrid(
 
         if (level == numLevels - 1) {
             // coarsest level accepts all remaining points
-            emitRemainingPoints<<<blocksPoints, threads>>>(
+            emitRemainingPoints<<<blocksPoints, blkPoints>>>(
                 d_positions, d_colors, d_writtenFlags,
                 numPoints, output, outputCounter, (uint8_t)level);
             cudaDeviceSynchronize();
@@ -114,7 +116,7 @@ void buildCLODLevels_denseGrid(
             ceil((aabbMax.y - aabbMin.y) / spacing),
             ceil((aabbMax.z - aabbMin.z) / spacing));
         int numVoxels = gridRes.x * gridRes.y * gridRes.z;
-        dim3 blocksVoxels((numVoxels + threads - 1) / threads);
+        dim3 blocksVoxels((numVoxels + blkVoxels - 1) / blkVoxels);
 
         // voxel ownership grid
         uint32_t* d_voxelOwners;
@@ -122,14 +124,14 @@ void buildCLODLevels_denseGrid(
         cudaMemset(d_voxelOwners, 0xFF, sizeof(uint32_t) * numVoxels);
 
         // mark winners
-        markVoxelsMinIdx<<<blocksPoints, threads>>>(
+        markVoxelsMinIdx<<<blocksPoints, blkPoints>>>(
             d_positions, d_writtenFlags, numPoints,
             aabbMin, spacing, gridRes, d_voxelOwners);
         
         cudaDeviceSynchronize();
 
         // sweep winners
-        sweepWinners<<<blocksVoxels, threads>>>(
+        sweepWinners<<<blocksVoxels, blkVoxels>>>(
             d_positions, d_colors, d_voxelOwners, d_writtenFlags,
             numVoxels, output, outputCounter, (uint8_t)level);
 
@@ -198,8 +200,7 @@ __global__  void filterPointsKernel(CLODPoints points, glm::vec3 camPos,
         int outIdx = atomicAdd(reducedAmt, 1);
         pos_buffer[outIdx] = points.positions[idx];
         unsigned int level = static_cast<unsigned int>(points.cols[idx].w);
-        unsigned char intensity = static_cast<unsigned char>(min(level * 20, 255u)); // scale factor for visualization
-        col_buffer[outIdx] = glm::ucvec3(1.0, 0.0, intensity);
+        unsigned uint8_t intensity = static_cast<unsigned char>(min(level * 20, 255u)); // scale factor for visualization
+        col_buffer[outIdx] = glm::ucvec3(255u, 0u, intensity);
     }
 }
-
