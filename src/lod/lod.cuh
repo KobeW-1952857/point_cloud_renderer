@@ -7,7 +7,7 @@
 
 __global__ void markVoxelsMinIdx(
     const glm::dvec3* positions,
-    const bool* writtenFlags,
+    const unsigned int* writtenFlags,
     int numPoints,
     glm::dvec3 aabbMin,
     float spacing,
@@ -15,7 +15,7 @@ __global__ void markVoxelsMinIdx(
     uint32_t* voxelOwners
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= numPoints || writtenFlags[idx]) return;
+    if (idx >= numPoints || writtenFlags[idx] == 1) return;
     
     glm::dvec3 pos = positions[idx];
     glm::ivec3 voxelCoord = glm::floor((pos - aabbMin) / spacing);
@@ -36,11 +36,11 @@ __global__ void sweepWinners(
     const glm::dvec3* positions,
     const glm::ucvec3* colors,
     const uint32_t* voxelOwners,
-    bool* writtenFlags,
+    unsigned int* writtenFlags,
     int numVoxels,
     CLODPoints output,
     unsigned int* outputCounter,
-    uint8_t level
+    const uint8_t level
 ) {
     int voxelIdx = blockIdx.x * blockDim.x + threadIdx.x;
     if (voxelIdx >= numVoxels) return;
@@ -48,8 +48,8 @@ __global__ void sweepWinners(
     uint32_t winnerIdx = voxelOwners[voxelIdx];
     if (winnerIdx == 0xFFFFFFFF) return;
 
-    if (atomicCAS((int*)&writtenFlags[winnerIdx], 0, 1) == 0) {
-        writtenFlags[winnerIdx] = true;
+    if (atomicCAS(&writtenFlags[winnerIdx], 0, 1) == 0) {
+        writtenFlags[winnerIdx] = 1;
         int outIdx = atomicAdd(outputCounter, 1);
         output.positions[outIdx] = positions[winnerIdx];
         output.cols[outIdx] = glm::ucvec4(colors[winnerIdx], level);
@@ -60,7 +60,7 @@ __global__ void sweepWinners(
 __global__ void emitRemainingPoints(
     const glm::dvec3* positions,
     const glm::ucvec3* colors,
-    bool* writtenFlags,
+    unsigned int* writtenFlags,
     int numPoints,
     CLODPoints output,
     unsigned int* outputCounter,
@@ -69,8 +69,8 @@ __global__ void emitRemainingPoints(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numPoints) return;
 
-    if (atomicCAS((int*)&writtenFlags[idx], 0, 1) == 0) {
-        writtenFlags[idx] = true;
+    if (atomicCAS(&writtenFlags[idx], 0, 1) == 0) {
+        writtenFlags[idx] = 1;
         int outIdx = atomicAdd(outputCounter, 1);
         output.positions[outIdx] = positions[idx];
         output.cols[outIdx] = glm::ucvec4(colors[idx], level);        
@@ -78,7 +78,7 @@ __global__ void emitRemainingPoints(
 }
 
 
-void buildCLODLevels_denseGrid(
+void buildCLODLevels(
     glm::dvec3* d_positions,
     glm::ucvec3* d_colors,
     int numPoints,
@@ -95,9 +95,9 @@ void buildCLODLevels_denseGrid(
     cudaOccupancyMaxPotentialBlockSize(&minGridSizeVoxels, &blkVoxels, sweepWinners);
     dim3 blocksPoints((numPoints + blkPoints - 1) / blkPoints);
 
-    bool* d_writtenFlags;
-    cudaMalloc(&d_writtenFlags, sizeof(bool) * numPoints);
-    cudaMemset(d_writtenFlags, 0, sizeof(bool) * numPoints);
+    unsigned int* d_writtenFlags;
+    cudaMalloc(&d_writtenFlags, sizeof(unsigned int) * numPoints);
+    cudaMemset(d_writtenFlags, 0, sizeof(unsigned int) * numPoints);
 
     for (int level = 0; level < numLevels; ++level) {
         float spacing = rootSpacing / powf(2.f, level);
@@ -157,30 +157,33 @@ __device__ float pseudoRandom(uint32_t seed) {
 
 
 __device__ bool shouldKeepPoint(
-    uint8_t level,
-    int pointIdx,
-    glm::dvec3 pointPos,
-    glm::dvec3 cameraPos,
-    float rootSpacing,
-    float clodFactor
+    const uint8_t level,
+    const int pointIdx,
+    const glm::dvec3 pointPos,
+    const glm::dvec3 cameraPos,
+    const float rootSpacing,
+    const float clodFactor
 ) {
-    float distance = glm::length(pointPos - cameraPos);
-    float targetSpacing = (distance * clodFactor) / 1000.f;
+    glm::dvec3 diff = pointPos - cameraPos;
+    float distSq = glm::dot(diff, diff);
+    float targetSpacingSq = ((clodFactor / 1000.f) * (clodFactor / 1000.f)) * distSq;
 
     float jitter = pseudoRandom(pointIdx);
     float jitteredLevel = (float)level + jitter;
 
     float pointSpacing = rootSpacing / powf(2.0f, jitteredLevel);
+    float pointSpacingSq = pointSpacing * pointSpacing;
 
-    return pointSpacing >= targetSpacing;
+    return pointSpacingSq >= targetSpacingSq;
+
 }
 
 
 __global__ void filterPointsKernel(
-        CLODPoints points,
-        float rootSpacing, float clodFactor, unsigned int pointAmt, 
+        const CLODPoints points,
+        const float rootSpacing, const float clodFactor, const unsigned int pointAmt, 
         glm::dvec3* pos_buffer, glm::ucvec3* col_buffer, 
-        unsigned int* reducedAmt, glm::dvec3 camPos
+        unsigned int* reducedAmt, const glm::dvec3 camPos
     ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= pointAmt) return;
