@@ -18,6 +18,14 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(glm)
 
+target_compile_options(PointCloudRenderer PRIVATE
+	-diag-suppress 20012
+	-O3
+	-rdc=true
+	-g
+	-lineinfo
+)
+
 set_target_properties(PointCloudRenderer PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 set_target_properties(PointCloudRenderer PROPERTIES CUDA_ARCHITECTURES "86")
 target_sources(PointCloudRenderer PRIVATE ${sources})

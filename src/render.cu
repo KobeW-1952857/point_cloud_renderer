@@ -1,8 +1,11 @@
-#include "glm/fwd.hpp"
-#include "glm/glm.hpp"
-#include "happly.h"
-#include "render.cuh"
+#include <sys/types.h>
+
+#include <cstdint>
 #include <cstdio>
+
+#include "glm/fwd.hpp"
+#include "render.cuh"
+#include "types.h"
 
 __device__ double atomicMin(double *address, double val) {
   unsigned long long int *address_as_ull = (unsigned long long int *)address;
@@ -11,13 +14,21 @@ __device__ double atomicMin(double *address, double val) {
 
   do {
     old_double = __longlong_as_double(old);
-    if (old_double <= val)
-      return old_double;
+    if (old_double <= val) return old_double;
     assumed = old;
     old = atomicCAS(address_as_ull, assumed, __double_as_longlong(val));
   } while (assumed != old);
 
   return __longlong_as_double(old);
+}
+
+__device__ uint64_t atomicMin(uint64_t *address, uint64_t val) {
+  uint64_t old;
+  do {
+    old = *address;
+    if (val >= old) return old;
+  } while (atomicCAS((unsigned long long *)address, old, val) != old);
+  return old;
 }
 
 __device__ double atomicMax(double *address, double val) {
@@ -27,8 +38,7 @@ __device__ double atomicMax(double *address, double val) {
 
   do {
     old_double = __longlong_as_double(old);
-    if (old_double >= val)
-      return old_double;
+    if (old_double >= val) return old_double;
     assumed = old;
     old = atomicCAS(address_as_ull, assumed, __double_as_longlong(val));
   } while (assumed != old);
@@ -44,61 +54,88 @@ __device__ unsigned char atomicExch(unsigned char *address, unsigned char val) {
   // This relies on the assumption that the unsigned char is part of an aligned
   // 32-bit word. If not, this approach might lead to issues or be less
   // efficient.
-  unsigned int *word_address =
-      (unsigned int *)((size_t)address & ~0x3); // Align to 4-byte boundary
+  unsigned int *word_address = (unsigned int *)((size_t)address & ~0x3);  // Align to 4-byte boundary
 
   // Calculate the byte offset within the word
-  int byte_offset = (size_t)address % 4; // 0, 1, 2, or 3
+  int byte_offset = (size_t)address % 4;  // 0, 1, 2, or 3
 
   unsigned int old_word;
   unsigned int new_word;
   unsigned char old_char_value;
 
   do {
-    old_word = *word_address; // Atomically read the entire 32-bit word
+    old_word = *word_address;  // Atomically read the entire 32-bit word
 
     // Extract the old unsigned char value
     old_char_value = (unsigned char)((old_word >> (byte_offset * 8)) & 0xFF);
 
     // Construct the new 32-bit word with the updated unsigned char
     new_word = old_word;
-    new_word &=
-        ~((unsigned int)0xFF << (byte_offset * 8));       // Clear the old byte
-    new_word |= ((unsigned int)val << (byte_offset * 8)); // Set the new byte
+    new_word &= ~((unsigned int)0xFF << (byte_offset * 8));  // Clear the old byte
+    new_word |= ((unsigned int)val << (byte_offset * 8));    // Set the new byte
 
-  } while (atomicCAS(word_address, old_word, new_word) !=
-           old_word); // Attempt to swap
+  } while (atomicCAS(word_address, old_word, new_word) != old_word);  // Attempt to swap
 
   return old_char_value;
 }
 
+__device__ __forceinline__ uint64_t packUCVec3(const glm::ucvec3 &v) {
+  return (static_cast<uint64_t>(v.r) << 0) | (static_cast<uint64_t>(v.g) << 8) | (static_cast<uint64_t>(v.b) << 16);
+}
+
+__device__ glm::ucvec3 unpackUCVec3(const uint64_t v) {
+  return glm::ucvec3(static_cast<unsigned char>((v >> 0) & 0xFF), static_cast<unsigned char>((v >> 8) & 0xFF),
+                     static_cast<unsigned char>((v >> 16) & 0xFF));
+}
+
+__device__ unsigned long long warpReduceMinULL(unsigned int mask, unsigned long long val) {
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    unsigned long long tmpVal = __shfl_down_sync(mask, val, offset);
+    if (val > tmpVal) val = tmpVal;
+  }
+  return val;
+}
+
 // Kernel to fill a double array with a specific value
-__global__ void fillDoubleArrayKernel(double *devArray, double value,
-                                      int numElements) {
+__global__ void fillDoubleArrayKernel(double *buffer, double value, int numElements) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < numElements) {
-    devArray[idx] = value;
+    buffer[idx] = value;
+  }
+}
+__global__ void fillBuffer(uint64_t *buffer, uint64_t value, int numElements) {
+  int block_id = blockIdx.x +                         // apartment number on this floor (points across)
+                 blockIdx.y * gridDim.x +             // floor number in this building (rows high)
+                 blockIdx.z * gridDim.x * gridDim.y;  // building number in this city (panes deep)
+
+  int block_offset = block_id *                             // times our apartment number
+                     blockDim.x * blockDim.y * blockDim.z;  // total threads per block (people per apartment)
+
+  int thread_offset = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
+
+  int idx = block_offset + thread_offset;  // global person id in the entire apartment complex
+
+  if (idx < numElements) {
+    // printf("FILL BUFFER ID: %u, Data: 0x%lX\n", idx, (unsigned long)value);
+    buffer[idx] = value;
   }
 }
 
-__global__ void naive(unsigned char *output_data, double *depht_buffer,
-                      int width, int height, const glm::mat4 *cam_proj,
-                      const glm::dvec3 *points, const glm::ucvec3 *colors,
-                      size_t n_points) {
+__global__ void naive(unsigned char *output_data, double *depht_buffer, int width, int height,
+                      const glm::mat4 *cam_proj, const glm::dvec3 *points, const glm::ucvec3 *colors, size_t n_points) {
   int id = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (id > n_points)
-    return;
+  if (id > n_points) return;
 
   glm::dvec3 point = points[id];
   glm::ucvec3 color = colors[id];
 
   // Convert input double3 to homogeneous double4
   glm::vec4 pointHomogeneous;
-  pointHomogeneous.x = points[id].x;
-  pointHomogeneous.y = points[id].y;
-  pointHomogeneous.z = points[id].z;
-  pointHomogeneous.w = 1.0; // W component for a point
+  pointHomogeneous.x = point.x;
+  pointHomogeneous.y = point.y;
+  pointHomogeneous.z = point.z;
+  pointHomogeneous.w = 1.0;  // W component for a point
 
   // Perform matrix-vector multiplication
   glm::vec4 result = *cam_proj * pointHomogeneous;
@@ -106,7 +143,6 @@ __global__ void naive(unsigned char *output_data, double *depht_buffer,
   int u = result.x / result.z;
   int v = result.y / result.z;
   if (u < width && u >= 0 && v < height && v >= 0 && result.z >= 0.0f) {
-
     double old = atomicMin(&depht_buffer[v * width + u], result.z);
     if (result.z < old) {
       atomicExch(&output_data[(v * width + u) * 3 + 0], color.r);
@@ -114,4 +150,76 @@ __global__ void naive(unsigned char *output_data, double *depht_buffer,
       atomicExch(&output_data[(v * width + u) * 3 + 2], color.b);
     }
   }
+}
+
+__device__ float4 matmul(const float m[16], const float4 &v) {
+  float4 result;
+  result.x = m[0] * v.x + m[1] * v.y + m[2] * v.z + m[3];
+  result.y = m[4] * v.x + m[5] * v.y + m[6] * v.z + m[7];
+  result.z = m[8] * v.x + m[9] * v.y + m[10] * v.z + m[11];
+  result.w = m[12] * v.x + m[13] * v.y + m[14] * v.z + m[15];
+  return result;
+}
+
+__device__ __forceinline__ unsigned int packuchar3(const uchar3 &v) {
+  return (static_cast<unsigned int>(v.x) << 0) | (static_cast<unsigned int>(v.y) << 8) |
+         (static_cast<unsigned int>(v.z) << 16);
+}
+
+__device__ uchar3 unpackuchar3(const unsigned int v) {
+  return {static_cast<unsigned char>((v >> 0) & 0xFF), static_cast<unsigned char>((v >> 8) & 0xFF),
+          static_cast<unsigned char>((v >> 16) & 0xFF)};
+}
+
+__global__ void vertexOrderOptimization(uint64_t *output_data, const float4 *vertices, const uchar4 *colors,
+                                        const float cam_proj[16], uint2 image_size, size_t n_points) {
+  int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (global_id >= n_points) return;
+
+  float4 point = __ldg(&vertices[global_id]);
+  uchar4 color = __ldg(&colors[global_id]);
+
+  // Perform matrix-vector multiplication
+  float4 result = matmul(cam_proj, point);
+
+  int u = rintf(__fdividef(result.x, result.z));
+  int v = rintf(__fdividef(result.y, result.z));
+  unsigned int pixID = v * image_size.x + u;
+
+  if (result.z < 0.0f || u < 0 || u >= image_size.x || v < 0 || v >= image_size.y) return;
+
+  unsigned int depth = __float_as_uint(result.z);
+
+  unsigned int same_pixel_mask = __match_any_sync(__activemask(), pixID);
+  unsigned int min_depth = __reduce_min_sync(same_pixel_mask, depth);
+
+  bool is_closest_thread = (depth == min_depth);
+
+  if (is_closest_thread) {
+    unsigned long long data = ((unsigned long long)depth << 32) | packuchar3({color.x, color.y, color.z});
+    atomicMin(&output_data[pixID], data);
+    return;
+  }
+}
+
+__global__ void resolve(glm::ucvec3 *image, const uint64_t *data, size_t count) {
+  int block_id = blockIdx.x +                         // apartment number on this floor (points across)
+                 blockIdx.y * gridDim.x +             // floor number in this building (rows high)
+                 blockIdx.z * gridDim.x * gridDim.y;  // building number in this city (panes deep)
+
+  int block_offset = block_id *                             // times our apartment number
+                     blockDim.x * blockDim.y * blockDim.z;  // total threads per block (people per apartment)
+
+  int thread_offset = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
+
+  int id = block_offset + thread_offset;  // global person id in the entire apartment complex
+
+  if (id > count) return;
+
+  uint64_t val = data[id];
+  // if (val == 0) return;
+  image[id] = unpackUCVec3(val);
+  // printf("RESOLVE ID: %u, Data: 0x%lX, Color: (%u, %u, %u)\n", id, (unsigned long)val, image[id].x, image[id].y,
+  //        image[id].z);
 }
