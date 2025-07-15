@@ -29,14 +29,13 @@ DVecPair findAABB(glm::dvec3* vertices, size_t vertexAmt) {
     bmin = glm::min(bmin, v);
     bmax = glm::max(bmax, v);
   }
-
+  std::cout << "BMIN: " << bmin << "  BMAX: " << bmax << std::endl;
   return { bmin, bmax };
 }
 
 void buildLODStructure(glm::dvec3* pos_host, glm::dvec3* pos_device, glm::ucvec3* col, size_t vertexAmt,
                        unsigned int* outputCounter, CLODPoints output) {
   auto aabb = findAABB(pos_host, vertexAmt);
-
   buildCLODLevels_denseGrid(pos_device, col, vertexAmt, aabb.first, aabb.second,
                              ROOT_SPACING, LEVELS_AMT, output, outputCounter);
 }
@@ -316,12 +315,14 @@ void renderLODs(const std::vector<glm::mat4>& extrinsics,
   unsigned int* d_filtered_points_amt = nullptr;
   cudaMalloc(&d_filtered_points_amt, sizeof(unsigned int));
 
-  int blkFilter = optimalBlockSize<filterPointsKernel>();
-  int blkNaive  = optimalBlockSize<naive>();
+  int blkFilter, blkNaive;
+  int minGridSize;
+  cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blkFilter, filterPointsKernel);
+  cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blkNaive, naive);
   int gridFilter = (data_size + blkFilter - 1) / blkFilter;
   int gridNaive  = (data_size + blkNaive  - 1) / blkNaive;
-  int gridFillArr = (cam.width * cam.height + 255)/256;
-  int blkFillArr = 256
+  int blkFillArr = 256;
+  int gridFillArr = (cam.width * cam.height + blkFillArr - 1) / blkFillArr;
   
   OptionalTimerWriter timer_writer(enable_timing, "../timings_lod.txt");
 
@@ -337,29 +338,30 @@ void renderLODs(const std::vector<glm::mat4>& extrinsics,
         cam.width * cam.height
     );
 
-    glm::vec3 cam_pos = glm::vec3(glm::inverse(extrinsic)[3]);
     glm::mat4 cam_proj = glm::mat4(glm::transpose(cam.intrinsic)) * extrinsic;
     cudaMemcpy(d_cam_proj, glm::value_ptr(cam_proj),
                sizeof(glm::mat4), cudaMemcpyHostToDevice);
 
     cudaMemset(d_output_image, 0, cam.width * cam.height * 3);
     memset(h_output_image, 0, cam.width * cam.height * 3);
+    glm::mat4 invView = glm::inverse(extrinsic);
+    glm::dvec3 camPos = glm::dvec3(invView[3]);
 
     filterPointsKernel<<<gridFilter, blkFilter>>>(
-        clod_points, cam_pos,
+        clod_points,
         ROOT_SPACING, CLOD_FACTOR,
         data_size,
         pos_render_buf, col_render_buf,
-        d_filtered_points_amt
+        d_filtered_points_amt, camPos
     );
     cudaDeviceSynchronize();
 
-    naive<<<gridNaive, blkNaive>>>(
-        d_output_image, d_depth_buffer,
-        cam.width, cam.height,
-        d_cam_proj,
-        pos_render_buf, col_render_buf, d_filtered_points_amt
-    );
+    // naive<<<gridNaive, blkNaive>>>(
+    //     d_output_image, d_depth_buffer,
+    //     cam.width, cam.height,
+    //     d_cam_proj,
+    //     pos_render_buf, col_render_buf, d_filtered_points_amt
+    // );
     cudaDeviceSynchronize();
 
     timer_writer.write(timer.ElapsedMillis());
@@ -454,12 +456,12 @@ int main(int argc, char* argv[]) {
   buildLODStructure(vertices.data(), d_vertices_data, d_color_data, data_size, clodCounter, clodPoints);
   printLevelHistogram(data_size, &clodPoints);
 
-  renderLODs(extrinsics, cam, paths.output, clodPoints, data_size,
-             d_output_image, d_depth_buffer, d_cam_proj, h_output_image,
-             pos_render_buffer, color_render_buffer, debug);
+  // renderLODs(extrinsics, cam, paths.output, clodPoints, data_size,
+  //            d_output_image, d_depth_buffer, d_cam_proj, h_output_image,
+  //            pos_render_buffer, color_render_buffer, debug);
 
-  // render(extrinsics, cam, paths.output, d_vertices_data, d_color_data, 
-  //   data_size, d_output_image, d_depth_buffer, d_cam_proj, h_output_image, debug);
+  render(extrinsics, cam, paths.output, d_vertices_data, d_color_data, 
+    data_size, d_output_image, d_depth_buffer, d_cam_proj, h_output_image, debug);
 
   // cleanup
   cudaFree(d_vertices_data);

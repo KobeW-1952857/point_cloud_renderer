@@ -8,6 +8,6 @@ struct CLODPoints {
 };
 
 // constants
-const float CLOD_FACTOR = 1.2;
-const int LEVELS_AMT = 5;
-const float ROOT_SPACING = 0.8;
+const float CLOD_FACTOR = 1.5;
+const int LEVELS_AMT = 6;
+const float ROOT_SPACING = 0.4;

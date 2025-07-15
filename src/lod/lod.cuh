@@ -48,8 +48,7 @@ __global__ void sweepWinners(
     uint32_t winnerIdx = voxelOwners[voxelIdx];
     if (winnerIdx == 0xFFFFFFFF) return;
 
-    // TODO: race condition
-    if (!writtenFlags[winnerIdx]) {
+    if (atomicCAS((int*)&writtenFlags[winnerIdx], 0, 1) == 0) {
         writtenFlags[winnerIdx] = true;
         int outIdx = atomicAdd(outputCounter, 1);
         output.positions[outIdx] = positions[winnerIdx];
@@ -70,7 +69,7 @@ __global__ void emitRemainingPoints(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numPoints) return;
 
-    if (!writtenFlags[idx]) {
+    if (atomicCAS((int*)&writtenFlags[idx], 0, 1) == 0) {
         writtenFlags[idx] = true;
         int outIdx = atomicAdd(outputCounter, 1);
         output.positions[outIdx] = positions[idx];
@@ -90,8 +89,10 @@ void buildCLODLevels_denseGrid(
     CLODPoints output,
     unsigned int* outputCounter
 ) {
-    const int blkPoints = optimalBlockSize<markVoxelsMinIdx>(); 
-    const int blkVoxels = optimalBlockSize<sweepWinners>();
+    int blkPoints, minGridSizePoints;
+    cudaOccupancyMaxPotentialBlockSize(&minGridSizePoints, &blkPoints, markVoxelsMinIdx);
+    int blkVoxels, minGridSizeVoxels;
+    cudaOccupancyMaxPotentialBlockSize(&minGridSizeVoxels, &blkVoxels, sweepWinners);
     dim3 blocksPoints((numPoints + blkPoints - 1) / blkPoints);
 
     bool* d_writtenFlags;
@@ -175,32 +176,48 @@ __device__ bool shouldKeepPoint(
 }
 
 
-// __global__  void filterPointsKernel(CLODPoints points, glm::vec3 camPos, 
-//     float rootSpacing, float clodFactor, unsigned int pointAmt, glm::dvec3* pos_buffer, 
-//     glm::ucvec3* col_buffer, unsigned int* reducedAmt) {
-    
-//     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-//     if (idx >= pointAmt) return;
-
-//     if (shouldKeepPoint(points.cols[idx].w, idx, points.positions[idx], camPos, rootSpacing, clodFactor)) {
-//         int outIdx = atomicAdd(reducedAmt, 1);
-//         pos_buffer[outIdx] = points.positions[idx];
-//         col_buffer[outIdx] = points.cols[idx];
-//     } // else discard point
-// }
-
-__global__  void filterPointsKernel(CLODPoints points, glm::vec3 camPos, 
-    float rootSpacing, float clodFactor, unsigned int pointAmt, glm::dvec3* pos_buffer, 
-    glm::ucvec3* col_buffer, unsigned int* reducedAmt) {
-    
+__global__ void filterPointsKernel(
+        CLODPoints points,
+        float rootSpacing, float clodFactor, unsigned int pointAmt, 
+        glm::dvec3* pos_buffer, glm::ucvec3* col_buffer, 
+        unsigned int* reducedAmt, glm::dvec3 camPos
+    ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= pointAmt) return;
 
     if (shouldKeepPoint(points.cols[idx].w, idx, points.positions[idx], camPos, rootSpacing, clodFactor)) {
         int outIdx = atomicAdd(reducedAmt, 1);
         pos_buffer[outIdx] = points.positions[idx];
-        unsigned int level = static_cast<unsigned int>(points.cols[idx].w);
-        unsigned uint8_t intensity = static_cast<unsigned char>(min(level * 20, 255u)); // scale factor for visualization
-        col_buffer[outIdx] = glm::ucvec3(255u, 0u, intensity);
-    }
+        col_buffer[outIdx] = points.cols[idx];
+    } // else discard point
 }
+
+// __global__ void filterPointsKernel(
+//         CLODPoints points,
+//         float rootSpacing, float clodFactor, unsigned int pointAmt, 
+//         glm::dvec3* pos_buffer, glm::ucvec3* col_buffer, 
+//         unsigned int* reducedAmt, glm::dvec3 camPos
+//     ) {
+//     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+//     if (idx >= pointAmt) return;
+    
+//     glm::dvec3 pointPos = points.positions[idx];
+
+//     if (shouldKeepPoint(points.cols[idx].w, idx, pointPos, camPos, rootSpacing, clodFactor)) {
+//         int outIdx = atomicAdd(reducedAmt, 1);
+//         pos_buffer[outIdx] = pointPos;
+
+//         uint8_t level = static_cast<uint8_t>(points.cols[idx].w);
+//         glm::ucvec3 color;
+//         switch (level) {
+//             case 0: color = glm::ucvec3(255, 0, 0); break;      // Red
+//             case 1: color = glm::ucvec3(0, 255, 0); break;      // Green
+//             case 2: color = glm::ucvec3(0, 0, 255); break;      // Blue
+//             case 3: color = glm::ucvec3(255, 255, 0); break;    // Yellow
+//             case 4: color = glm::ucvec3(255, 0, 255); break;    // Magenta
+//             // case 5: color = glm::ucvec3(0, 255, 255); break;    // Cyan
+//             case 5: color = glm::ucvec3(0, 0, 0); break;  
+//         }
+//         col_buffer[outIdx] = color;
+//     }
+// }

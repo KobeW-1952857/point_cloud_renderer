@@ -162,15 +162,7 @@ inline  __host__ __device__ glm::dvec3 operator/(glm::dvec3 a, float b)
     return { a.x / b, a.y / b, a.z / b };
 }
 
-
-template <typename KernelT>
-static inline int optimalBlockSize()
-{
-    static int cached = 0;
-    if (cached == 0) {
-        int minGrid, blk;
-        cudaOccupancyMaxPotentialBlockSize(&minGrid, &blk, KernelT);
-        cached = blk;                // remember for future calls
-    }
-    return cached;
+inline std::ostream& operator<<(std::ostream& os, const glm::dvec3& v) {
+    os << "dvec3(" << v.x << ", " << v.y << ", " << v.z << ")";
+    return os;
 }
