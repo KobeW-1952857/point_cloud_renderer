@@ -47,8 +47,9 @@ def print_statistics(name, times):
 
 
 # Create a figure with two subplots
-fig, axes = plt.subplots(1, 2, figsize=(18, 7)) # Adjust figure size to accommodate two plots
-datasets = ['Naive', 'VOO', 'VOO_early', 'VOO_dedup']
+fig, axes = plt.subplots(1, 2, figsize=(12, 5)) # Adjust figure size to accommodate two plots
+# datasets = ['Naive', 'VOO', 'VOO_early', 'VOO_dedup', 'VOO_optim', 'VOO_optim_no_write', 'VOO_optim_async_write', 'VOO_optim_async_write_more_threads']
+datasets = ['Naive', 'VOO_optim_async_write_more_threads']
 box_plot_data =[]
 
 for dataset in datasets:

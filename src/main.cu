@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 
+#include "AsyncImageWriter.h"
 #include "Timer.h"
 #include "glm/fwd.hpp"
 #include "glm/matrix.hpp"
@@ -105,8 +106,8 @@ bool readExtrinsics(const std::string &file_path, std::vector<glm::mat4> &extrin
   return true;
 }
 // Function to save raw RGBA pixel data to a PPM image file
-void savePPMImage(const std::string &filename, const std::vector<glm::ucvec3> &data, int width, int height,
-                  bool binary = true, bool verbose = false) {
+void savePPMImage(const std::string &filename, const uchar3 *data, int width, int height, bool binary = true,
+                  bool verbose = false) {
   std::ofstream file(filename, binary ? std::ios::binary : std::ios::out);
   if (!file.is_open()) {
     std::cerr << "Error: Could not open file " << filename << " for writing." << std::endl;
@@ -225,14 +226,13 @@ int main(int argc, char *argv[]) {
   // Device buffers
   float4 *d_vertices_data;
   uchar4 *d_color_data;
-  double *d_depth_buffer;
   uint64_t *d_output;
   glm::ucvec3 *d_image;
   glm::mat4 *d_cam_proj;
 
   // Host buffers
-  std::vector<glm::ucvec3> h_image;
-  h_image.reserve(cam.height * cam.width);
+  uchar3 *h_image;
+  cudaHostAlloc((void **)&h_image, cam.width * cam.height * sizeof(glm::ucvec3), cudaHostAllocDefault);
   const size_t data_size = vertices.size();
   uint2 image_size = {cam.width, cam.height};
 
@@ -240,13 +240,12 @@ int main(int argc, char *argv[]) {
   CUDA_ERROR(cudaMalloc(&d_color_data, data_size * sizeof(uint4)));
   CUDA_ERROR(cudaMalloc(&d_output, cam.width * cam.height * sizeof(uint64_t)));
   CUDA_ERROR(cudaMalloc(&d_image, cam.width * cam.height * sizeof(glm::ucvec3)));
-  CUDA_ERROR(cudaMalloc(&d_depth_buffer, cam.width * cam.height * sizeof(double)))
   CUDA_ERROR(cudaMalloc(&d_cam_proj, sizeof(glm::mat4)));
 
   CUDA_ERROR(cudaMemcpy(d_vertices_data, vertices.data(), data_size * sizeof(float4), cudaMemcpyHostToDevice));
   CUDA_ERROR(cudaMemcpy(d_color_data, colors.data(), data_size * sizeof(uchar4), cudaMemcpyHostToDevice));
-  // CUDA_ERROR(cudaMemcpyToSymbol(image_size, &image_size, sizeof(uint2), cudaMemcpyHostToDevice));
-  // CUDA_ERROR(cudaMemcpyToSymbol(n_points, &data_size, sizeof(size_t), cudaMemcpyHostToDevice));
+
+  AsyncImageWriter image_writer(std::thread::hardware_concurrency() - 1);
 
   int min_grid_size;
   int block_size;
@@ -259,17 +258,14 @@ int main(int argc, char *argv[]) {
   int i = 0;
   for (auto &extrinsic : extrinsics) {
     fillBuffer<<<grid_dim, block_dim>>>(d_output, 0xFFFFFFFFFF000000, cam.width * cam.height);
-    cudaDeviceSynchronize();
 
     glm::mat4 camProj = glm::transpose(glm::mat4(glm::transpose(cam.intrinsic)) * extrinsic);
 
-    // CUDA_ERROR(cudaMemcpyToSymbol(cam_proj, glm::value_ptr(camProj), sizeof(glm::mat4), cudaMemcpyHostToDevice));
     CUDA_ERROR(cudaMemcpy(d_cam_proj, glm::value_ptr(camProj), sizeof(glm::mat4), cudaMemcpyHostToDevice));
-    h_image.clear();
+    CUDA_ERROR(cudaMemset(h_image, 0, cam.width * cam.height * sizeof(uchar3)))
 
     {
-      auto timer = ScopedTimer("VOO dedup " + std::to_string(i));
-
+      auto timer = ScopedTimer("VOO optim " + std::to_string(i));
       vertexOrderOptimization<<<num_blocks, block_size>>>(d_output, d_vertices_data, d_color_data, (float *)d_cam_proj,
                                                           image_size, data_size);
       cudaDeviceSynchronize();
@@ -278,21 +274,28 @@ int main(int argc, char *argv[]) {
       cudaDeviceSynchronize();
     }
 
-    CUDA_ERROR(
-        cudaMemcpy(h_image.data(), d_image, cam.height * cam.width * sizeof(glm::ucvec3), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(h_image, d_image, cam.height * cam.width * sizeof(uchar3), cudaMemcpyDeviceToHost));
 
-    savePPMImage(paths.output + "/" + std::to_string(i++) + ".ppm", h_image, cam.width, cam.height, true, false);
+    ImageSaveTask current_task;
+    current_task.filename = paths.output + "/" + std::to_string(i++) + ".ppm";
+    current_task.pixel_data.assign(h_image, h_image + cam.width * cam.height);
+    current_task.width = cam.width;
+    current_task.height = cam.height;
+    image_writer.enqueue(std::move(current_task));
   }
 
-  cudaFree(&d_vertices_data);
-  cudaFree(&d_color_data);
-  cudaFree(&d_depth_buffer);
-  cudaFree(&d_output);
+  cudaFree(d_vertices_data);
+  cudaFree(d_color_data);
+  cudaFree(d_output);
+  cudaFree(d_image);
+  cudaFree(d_cam_proj);
+  cudaFreeHost(h_image);
 
-  // std::string command = "ffmpeg -y -framerate 6 -i " + paths.output + "/%d.ppm -c:v libx264 -pix_fmt yuv420p -r 6" +
-  //                       paths.output + "/output.mp4";
-  // int result = system(command.c_str());
-  // if (result != 0) std::cerr << "Video conversion failed with error code: " << result << std::endl;
+  std::string command = "ffmpeg -y -framerate 6 -i " + paths.output + "/%d.ppm -c:v libx264 -pix_fmt yuv420p -r 6 " +
+                        paths.output + "/output.mp4";
+
+  int result = system(command.c_str());
+  if (result != 0) std::cerr << "Video conversion failed with error code: " << result << std::endl;
 
   return 0;
 }
