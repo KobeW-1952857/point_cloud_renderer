@@ -1,5 +1,6 @@
 #include <sys/types.h>
 
+#include <cfloat>
 #include <cstdint>
 #include <cstdio>
 
@@ -203,7 +204,57 @@ __global__ void vertexOrderOptimization(uint64_t *output_data, const float4 *ver
   }
 }
 
-__global__ void resolve(glm::ucvec3 *image, const uint64_t *data, size_t count) {
+__device__ int warpReduceMax(int val) {
+  for (int offset = 16; offset > 0; offset /= 2) {
+    val = max(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+  }
+  return val;
+}
+
+__global__ void findBlockMaxKernel(uint64_t *d_in, uint32_t *d_block_maxes, size_t size) {
+  // Shared memory for block-level reduction
+  extern __shared__ uint32_t s_data[];
+
+  // Global thread index
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+  // Load one element into shared memory
+  s_data[threadIdx.x] = (tid < size) && d_in[tid] != 0xFFFFFFFFFF000000 ? d_in[tid] >> 32 : 0;
+  __syncthreads();
+
+  // Block-level reduction using shared memory
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      s_data[threadIdx.x] = max(s_data[threadIdx.x], s_data[threadIdx.x + s]);
+    }
+    __syncthreads();
+  }
+
+  // Write the block's max to global memory
+  if (threadIdx.x == 0) {
+    d_block_maxes[blockIdx.x] = s_data[0];
+  }
+}
+
+__global__ void findAbsoluteMaxKernel(uint32_t *d_block_maxes, uint32_t *d_absolute_max, size_t num_blocks) {
+  // The first thread finds the max of the block maxes
+  int tid = threadIdx.x;
+  uint32_t my_max = 0;
+
+  for (int i = tid; i < num_blocks; i += blockDim.x) {
+    my_max = max(my_max, d_block_maxes[i]);
+  }
+
+  // Use warp reduction to find the final max
+  my_max = warpReduceMax(my_max);
+
+  if (threadIdx.x == 0) {
+    d_absolute_max[0] = my_max;
+  }
+}
+
+__global__ void resolve(glm::ucvec3 *image, glm::ucvec3 *depth, const uint32_t *max_depth, const uint64_t *data,
+                        size_t count) {
   int block_id = blockIdx.x +                         // apartment number on this floor (points across)
                  blockIdx.y * gridDim.x +             // floor number in this building (rows high)
                  blockIdx.z * gridDim.x * gridDim.y;  // building number in this city (panes deep)
@@ -218,8 +269,12 @@ __global__ void resolve(glm::ucvec3 *image, const uint64_t *data, size_t count) 
   if (id > count) return;
 
   uint64_t val = data[id];
-  // if (val == 0) return;
+  if (val == 0xFFFFFFFFFF000000) return;
   image[id] = unpackUCVec3(val);
+
+  float depth_val = __uint_as_float((uint)(val >> 32));
+  unsigned char col = max(__fdiv_rn(__fmul_rn(depth_val, 255.0f), __uint_as_float(*max_depth)), 255.0f);
+  depth[id] = {col, col, col};
   // printf("RESOLVE ID: %u, Data: 0x%lX, Color: (%u, %u, %u)\n", id, (unsigned long)val, image[id].x, image[id].y,
   //        image[id].z);
 }

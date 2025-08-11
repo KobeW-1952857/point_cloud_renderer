@@ -1,4 +1,5 @@
 #include <sys/types.h>
+#include <thrust/reduce.h>
 
 #include <cstdint>
 #include <filesystem>
@@ -151,6 +152,7 @@ struct Paths {
   std::string camera;
   std::string extrinsics;
   std::string output;
+  std::string depth;
   bool succes = true;
 
   Paths(const std::string base_path, bool verbose = false) : base(base_path) {
@@ -159,11 +161,13 @@ struct Paths {
     const std::filesystem::path cameras_rel = "iphone/colmap/cameras.txt";
     const std::filesystem::path images_rel = "iphone/colmap/images.txt";
     const std::filesystem::path renders_rel = "renders";
+    const std::filesystem::path depth_rel = "depth";
 
     data = base / pc_aligned_rel;
     camera = base / cameras_rel;
     extrinsics = base / images_rel;
     output = base / renders_rel;
+    depth = base / depth_rel;
 
     if (!std::filesystem::exists(data) || !std::filesystem::is_regular_file(data)) {
       std::cerr << "Error: Required file not found or is not a regular file: " << data << std::endl;
@@ -185,6 +189,12 @@ struct Paths {
                    "creating directory: "
                 << output << std::endl;
       std::filesystem::create_directory(output);
+    }
+    if (!std::filesystem::exists(depth) || !std::filesystem::is_directory(depth)) {
+      std::cerr << "Error: Required directory not found or is not a directory, "
+                   "creating directory: "
+                << depth << std::endl;
+      std::filesystem::create_directory(depth);
     }
     if (verbose) std::cout << "All required paths exist and are valid." << std::endl;
   }
@@ -228,11 +238,16 @@ int main(int argc, char *argv[]) {
   uchar4 *d_color_data;
   uint64_t *d_output;
   glm::ucvec3 *d_image;
+  glm::ucvec3 *d_depth;
   glm::mat4 *d_cam_proj;
+  uint32_t *d_block_maxes;
+  uint32_t *d_absolute_max;
 
   // Host buffers
   uchar3 *h_image;
-  cudaHostAlloc((void **)&h_image, cam.width * cam.height * sizeof(glm::ucvec3), cudaHostAllocDefault);
+  cudaHostAlloc((void **)&h_image, cam.width * cam.height * sizeof(uchar3), cudaHostAllocDefault);
+  uchar3 *h_depth;
+  cudaHostAlloc((void **)&h_depth, cam.width * cam.height * sizeof(uchar3), cudaHostAllocDefault);
   const size_t data_size = vertices.size();
   uint2 image_size = {cam.width, cam.height};
 
@@ -240,7 +255,10 @@ int main(int argc, char *argv[]) {
   CUDA_ERROR(cudaMalloc(&d_color_data, data_size * sizeof(uint4)));
   CUDA_ERROR(cudaMalloc(&d_output, cam.width * cam.height * sizeof(uint64_t)));
   CUDA_ERROR(cudaMalloc(&d_image, cam.width * cam.height * sizeof(glm::ucvec3)));
+  CUDA_ERROR(cudaMalloc(&d_depth, cam.width * cam.height * sizeof(glm::ucvec3)));
   CUDA_ERROR(cudaMalloc(&d_cam_proj, sizeof(glm::mat4)));
+  CUDA_ERROR(cudaMalloc(&d_block_maxes, cam.width * cam.height * sizeof(uint32_t)));
+  CUDA_ERROR(cudaMalloc(&d_absolute_max, sizeof(uint32_t)))
 
   CUDA_ERROR(cudaMemcpy(d_vertices_data, vertices.data(), data_size * sizeof(float4), cudaMemcpyHostToDevice));
   CUDA_ERROR(cudaMemcpy(d_color_data, colors.data(), data_size * sizeof(uchar4), cudaMemcpyHostToDevice));
@@ -269,19 +287,31 @@ int main(int argc, char *argv[]) {
       vertexOrderOptimization<<<num_blocks, block_size>>>(d_output, d_vertices_data, d_color_data, (float *)d_cam_proj,
                                                           image_size, data_size);
       cudaDeviceSynchronize();
-
-      resolve<<<grid_dim, block_dim>>>(d_image, d_output, cam.width * cam.height);
+      findBlockMaxKernel<<<grid_dim, block_dim, 16 * 16 * sizeof(uint32_t)>>>(d_output, d_block_maxes, data_size);
+      cudaDeviceSynchronize();
+      findAbsoluteMaxKernel<<<1, block_dim>>>(d_block_maxes, d_absolute_max, grid_dim.x * grid_dim.y);
+      cudaDeviceSynchronize();
+      resolve<<<grid_dim, block_dim>>>(d_image, d_depth, d_absolute_max, d_output, cam.width * cam.height);
       cudaDeviceSynchronize();
     }
 
     CUDA_ERROR(cudaMemcpy(h_image, d_image, cam.height * cam.width * sizeof(uchar3), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(h_depth, d_depth, cam.height * cam.width * sizeof(uchar3), cudaMemcpyDeviceToHost));
 
     ImageSaveTask current_task;
-    current_task.filename = paths.output + "/" + std::to_string(i++) + ".ppm";
+    current_task.filename = paths.output + "/" + std::to_string(i) + ".ppm";
     current_task.pixel_data.assign(h_image, h_image + cam.width * cam.height);
     current_task.width = cam.width;
     current_task.height = cam.height;
     image_writer.enqueue(std::move(current_task));
+
+    current_task.filename = paths.depth + "/" + std::to_string(i) + ".ppm";
+    current_task.pixel_data.assign(h_depth, h_depth + cam.width * cam.height);
+    current_task.width = cam.width;
+    current_task.height = cam.height;
+    image_writer.enqueue(std::move(current_task));
+
+    i++;
   }
 
   cudaFree(d_vertices_data);
@@ -289,13 +319,15 @@ int main(int argc, char *argv[]) {
   cudaFree(d_output);
   cudaFree(d_image);
   cudaFree(d_cam_proj);
+  cudaFree(d_block_maxes);
+  cudaFree(d_absolute_max);
   cudaFreeHost(h_image);
 
-  std::string command = "ffmpeg -y -framerate 6 -i " + paths.output + "/%d.ppm -c:v libx264 -pix_fmt yuv420p -r 6 " +
-                        paths.output + "/output.mp4";
+  // std::string command = "ffmpeg -y -framerate 6 -i " + paths.output + "/%d.ppm -c:v libx264 -pix_fmt yuv420p -r 6 " +
+  //                       paths.output + "/output.mp4";
 
-  int result = system(command.c_str());
-  if (result != 0) std::cerr << "Video conversion failed with error code: " << result << std::endl;
+  // int result = system(command.c_str());
+  // if (result != 0) std::cerr << "Video conversion failed with error code: " << result << std::endl;
 
   return 0;
 }
